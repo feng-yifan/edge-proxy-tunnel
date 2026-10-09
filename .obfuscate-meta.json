@@ -1,0 +1,9 @@
+{
+  "source_file": "_worker.js",
+  "source_sha256": "f7cab284bfc5128d97ae57110c800f76ca88eab0af9afe5db14dc927fbcf5c8f",
+  "source_commit": "27e1e47447e5601114a688913d33eca8bf3ddb95",
+  "source_version": "2026-10-08 22:23:27",
+  "obfuscator": "javascript-obfuscator@5.9.0",
+  "seed": "4050135354",
+  "generated_at": "2026-10-09T23:01:02Z"
+}
