@@ -14,17 +14,16 @@ Cloudflare 仍会按 `_worker.js` 的代码特征做识别。本仓库在原有�
 | 分支 | 内容 | 用途 |
 | --- | --- | --- |
 | `main` | 上游原始代码（`_worker.js` 未混淆，含上游的伪装注释） | 只用于跟随上游；**不要拿它部署** |
-| `deploy` | 混淆后的 `_worker.js` + `wrangler.toml` + `README.md`（部署说明）+ `.obfuscate-meta.json` | **Cloudflare 部署分支**，由流水线独占管理 |
+| `deploy` | 混淆后的 `_worker.js` + `wrangler.toml` + `.obfuscate-meta.json` | **Cloudflare 部署分支**，由流水线独占管理 |
 
-`deploy` 分支每次发布都是**单个孤儿提交 + force-push**，内容只有 CF 部署需要的四个文件：
+`deploy` 分支每次发布都是**单个孤儿提交 + force-push**，内容只有 CF 部署需要的三个文件：
 
 - `_worker.js`：混淆后的 Worker 入口（名字与 `wrangler.toml` 的 `main` 保持一致）
 - `wrangler.toml`：从 `main` 原样复制（`name` / `main` / `compatibility_date` / `keep_vars`）
-- `README.md`：从 `main` 的 `DEPLOY.md` 同步的部署说明（给日后自己/他人看，含 CF 接入步骤）
 - `.obfuscate-meta.json`：本次产物来源（源指纹、源提交、上游版本号、随机种子、生成时间）
 
 > ⚠️ **不要手改 `deploy` 分支**：任何手写提交都会在下一次发布时被 force-push 覆盖。
-> 要改配置请改 `main` 上的 `obfuscate.config.json`，要改部署说明请改 `main` 上的 `DEPLOY.md`。
+> 要改配置请改 `main` 上的 `obfuscate.config.json`。
 
 ## 流水线（`.github/workflows/obfuscate-worker.yml`）
 
@@ -86,26 +85,13 @@ worker 与外部管理面板 / 订阅客户端之间的 JSON 结构里，改名�
 > `controlFlowFlattening: true` → `deadCodeInjection: true` → `identifierNamesGenerator: "mangled-shuffled"`
 > → `stringArrayEncoding: ["rc4"]` → 调 `stringArrayWrappersCount`。也可以只换 `seed` 让每次部署的产物都不同。
 
-## Cloudflare 侧配置（Workers + Git 集成）
+## Cloudflare 侧配置
 
-**为什么要绕一步**：CF 的 Git 集成在接入时会按默认分支（`main`）构建部署一次，而 `main` 上是被识别的
-未混淆代码——这正是收到**滥用报告（abuse report）**的常见来源。所以要用「先建模板 Worker、再接仓库、
-最后把生产分支改成 `deploy`」的顺序，让 CF 从头到尾都不会拿 `main` 去部署。
-
-1. **先部署一个默认模板**：`Workers & Pages → Create → Start with Hello World` → 部署（与仓库无关，无风险）
-2. **再接入仓库**：该 Worker → `Settings → Build → Connect / Git Repository` → 选本仓库；
-   Build command 留空，Deploy command 保持默认 `npx wrangler deploy`
-3. **生产分支改为 `deploy`**：`Settings → Build → Branch control / Production branch` → `deploy`，
-   然后手动触发一次部署确认构建的是 `deploy`（而不是 `main`）
-4. **运行时配置**（做一次）：变量 `ADMIN`、KV 绑定（变量名必须是 `KV`）、自定义域
-5. **验证**：`https://<域名>/admin` 出登录页；`/sub?token=…&clash` 能拉到订阅
-
-完整图文步骤同步在 `deploy` 分支的 `README.md`（源文件为本仓库 `main` 的 `DEPLOY.md`）。
-
-> ⚠️ `wrangler.toml` 的 `name`（当前 `v20251104`）决定 `wrangler deploy` 部署到哪个 Worker，
-> 请让接入 Git 的 Worker 名字与之一致。
-
+Cloudflare 侧必须从本仓库的 **`deploy`** 分支部署：`main` 上是未混淆代码，部署它会直接暴露被识别的特征，
+容易被下发滥用报告（abuse report）甚至封停 Worker。
 `sync.yml` / 本流水线推 `main` 不会触发部署，**只有 `deploy` 分支被推送时 CF 才构建部署**。
+
+> CF 控制台的接入路径与分支设置项随版本变动，具体操作以控制台实际流程为准，本仓库不固化步骤。
 
 ## 本地复现
 

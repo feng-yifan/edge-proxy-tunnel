@@ -16,7 +16,6 @@ on:
       - _worker.js
       - wrangler.toml
       - obfuscate.config.json
-      - DEPLOY.md
       - scripts/obfuscate-worker.sh
       - scripts/worker-smoke-test.sh
       - .github/workflows/obfuscate-worker.yml
@@ -65,7 +64,7 @@ jobs:
         id: source
         run: |
           set -euo pipefail
-          SHA=$( { sha256sum "$SOURCE_FILE"; sha256sum obfuscate.config.json; sha256sum DEPLOY.md; } | sha256sum | awk '{print $1}' )
+          SHA=$( { sha256sum "$SOURCE_FILE"; sha256sum obfuscate.config.json; } | sha256sum | awk '{print $1}' )
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "本次源指纹: $SHA"
 
@@ -130,8 +129,6 @@ jobs:
           mkdir -p "$DEPLOY_DIR"
           cp "$RUNNER_TEMP/obfuscated-worker.js" "$DEPLOY_DIR/$SOURCE_FILE"
           cp wrangler.toml "$DEPLOY_DIR/wrangler.toml"
-          # 部署分支自带部署说明（本分支会被 force-push 覆盖，手写的 README 留不住）
-          cp DEPLOY.md "$DEPLOY_DIR/README.md"
 
           VERSION=$(grep -oE "Version = '[^']+'" "$SOURCE_FILE" | head -1 | sed -E "s/.*'([^']+)'.*/\1/" || true)
           cat > "$DEPLOY_DIR/.obfuscate-meta.json" <<EOF
@@ -175,7 +172,7 @@ jobs:
           git checkout --orphan "$DEPLOY_BRANCH"
           git rm -rf . --quiet
           cp -r "$DEPLOY_DIR/." .
-          git add "$SOURCE_FILE" wrangler.toml README.md .obfuscate-meta.json
+          git add "$SOURCE_FILE" wrangler.toml .obfuscate-meta.json
           git commit --quiet -m "obfuscate: $SOURCE_FILE from main@$SOURCE_COMMIT (seed $SEED)"
           git push --force origin "HEAD:refs/heads/$DEPLOY_BRANCH"
 
