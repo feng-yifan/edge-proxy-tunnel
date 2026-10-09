@@ -57,18 +57,33 @@ Cloudflare 仍会按 `_worker.js` 的代码特征做识别。本仓库在原有�
 | --- | --- | --- |
 | `target` | `browser-no-eval` | Cloudflare Workers 运行时禁止 `eval` / `new Function` |
 | `stringArray` + `stringArrayEncoding: base64` | 开 | 字符串常量（域名、路径、协议名等特征）进入数组并 base64 存储 |
+| `stringArrayThreshold` | `1` | 所有可入组的字符串都入组，不留明文（对象属性名不在此列，见下） |
 | `splitStrings` | 开 | 再把长字符串切碎 |
 | `identifierNamesGenerator` | `hexadecimal` | 标识符十六进制化 |
-| `renameGlobals` / `renameProperties` | **关** | 保命项：`env.KV`、请求头、`Proxy.name` 等依赖内建全局与属性名 |
+| `renameGlobals` | **开** | 模块顶层的函数/变量名一并改名。上游代码顶层有大量**中文函数名**（如 `特征码字典`、`数据转Uint8Array`、`拼接字节数据`），关掉的话它们会原样留在产物里成为强特征（实测残留 428 处） |
+| `renameProperties` | **关** | 属性名是配置 JSON 与外部管理面板/订阅客户端的**契约**，改名会破坏兼容；`env.KV`、请求头等也依赖属性名 |
 | `selfDefending` / `debugProtection` | **关** | 兼容性优先，避免与 CF 运行时/压缩冲突 |
 | `controlFlowFlattening` / `deadCodeInjection` | **关** | 兼容性与运行时性能优先 |
 
-默认效果：5.14MB 源文件（其中 4.8MB 是上游的希伯来文伪装注释）→ **约 412KB 纯混淆代码**；
+默认效果：5.14MB 源文件（其中 4.8MB 是上游的希伯来文伪装注释）→ **约 422KB 纯混淆代码**；
 混淆耗时约 2 秒。按需求，产物**只保留混淆代码**，上游那段伪装注释会被丢弃。
 
-> 如果 CF 仍能识别，可按 `main` 上的顺序逐项加码后重新运行流水线（每次都要靠冒烟测试兜底）：
+### 混淆覆盖情况（实测，对照产物）
+
+| 特征类别 | 旧配置（`renameGlobals: false`） | 现配置 |
+| --- | --- | --- |
+| 中文标识符（函数/变量名） | 428 处 | **9 处**（且全是对象解构键/属性名） |
+| 明文字符串（含中文） | 340 处 | **229 处**，全部是**对象属性名** |
+| `export default` 入口 | 保留 | 保留 |
+
+**故意保留的部分**：对象属性名（`'协议'`、`'加密方式'`、`'名称'`…）不会被改名，因为它们出现在
+worker 与外部管理面板 / 订阅客户端之间的 JSON 结构里，改名会让后台面板和客户端配置读不出来。
+这是配置侧的安全边界——想进一步隐藏属性名就得改上游代码（把配置契约改成不含语义的名字），
+不建议在流水线里做。
+
+> 如果 CF 仍能识别，可在 `obfuscate.config.json` 里逐项加码后重新运行流水线（每次都要靠冒烟测试兜底）：
 > `controlFlowFlattening: true` → `deadCodeInjection: true` → `identifierNamesGenerator: "mangled-shuffled"`
-> → `identifiersPrefix` 换前缀 → 调 `stringArrayThreshold`。也可以只换 `seed` 让每次部署的产物都不同。
+> → `stringArrayEncoding: ["rc4"]` → 调 `stringArrayWrappersCount`。也可以只换 `seed` 让每次部署的产物都不同。
 
 ## Cloudflare 侧配置（连接 GitHub 自动部署）
 
