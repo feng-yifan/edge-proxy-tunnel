@@ -1,0 +1,181 @@
+name: Obfuscate Worker
+
+# 目的：每次 main 上的 _worker.js 发生变化（上游同步 / 手动改动）后，自动混淆并发布到
+#       ${{ env.DEPLOY_BRANCH }} 分支，Cloudflare 直接连接该分支完成部署。
+#
+# 为什么用 workflow_run：sync.yml 用 GITHUB_TOKEN 推送 main，而 GitHub 不会为
+# GITHUB_TOKEN 的推送触发其它 workflow 的 push 事件；workflow_run 不受此限制。
+on:
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - _worker.js
+      - wrangler.toml
+      - obfuscate.config.json
+      - scripts/obfuscate-worker.sh
+      - scripts/worker-smoke-test.sh
+      - .github/workflows/obfuscate-worker.yml
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: 混淆随机种子（留空则随机生成；相同种子产物可复现）
+        required: false
+        default: ""
+      force:
+        description: 源文件未变化时也强制重新混淆
+        type: boolean
+        default: false
+
+concurrency:
+  group: obfuscate-worker
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  DEPLOY_BRANCH: deploy
+  SOURCE_FILE: _worker.js
+  OBFUSCATOR_VERSION: 5.9.0
+  WRANGLER_VERSION: 4.149.0
+
+jobs:
+  obfuscate:
+    name: 混淆 _worker.js 并发布到 deploy 分支
+    runs-on: ubuntu-latest
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: 检出 main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 安装 Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: 判断源文件是否变化
+        id: source
+        run: |
+          set -euo pipefail
+          SHA=$( { sha256sum "$SOURCE_FILE"; sha256sum obfuscate.config.json; } | sha256sum | awk '{print $1}' )
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "本次源指纹: $SHA"
+
+          PREV=""
+          if git fetch --depth=1 origin "$DEPLOY_BRANCH" 2>/dev/null; then
+            PREV=$(git show "FETCH_HEAD:.obfuscate-meta.json" 2>/dev/null \
+              | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{process.stdout.write(String(JSON.parse(s).source_sha256||""))}catch{}})' \
+              || true)
+          fi
+          echo "deploy 分支上次源指纹: ${PREV:-<无>}"
+
+          if [ "$PREV" = "$SHA" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "源文件与混淆配置均未变化，跳过本次混淆。"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装混淆与验证工具
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/obf-tools"
+          mkdir -p "$TOOLS_DIR"
+          npm install --prefix "$TOOLS_DIR" --no-save --no-audit --no-fund \
+            "javascript-obfuscator@$OBFUSCATOR_VERSION" "wrangler@$WRANGLER_VERSION"
+          "$TOOLS_DIR/node_modules/.bin/javascript-obfuscator" --version
+          "$TOOLS_DIR/node_modules/.bin/wrangler" --version
+
+      - name: 混淆 ${{ env.SOURCE_FILE }}
+        id: obfuscate
+        if: steps.source.outputs.skip != 'true'
+        env:
+          SEED_INPUT: ${{ inputs.seed }}
+        run: |
+          set -euo pipefail
+          TOOLS_DIR="$RUNNER_TEMP/obf-tools"
+          SEED="${SEED_INPUT:-}"
+          if [ -z "$SEED" ]; then
+            SEED=$(( ${SRANDOM:-$RANDOM} ))
+            [ "$SEED" -eq 0 ] && SEED=1
+          fi
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+          OBFUSCATOR_BIN="$TOOLS_DIR/node_modules/.bin/javascript-obfuscator" \
+            bash scripts/obfuscate-worker.sh "$SOURCE_FILE" "$RUNNER_TEMP/obfuscated-worker.js" "$SEED"
+
+      - name: 等价冒烟测试（本地 workerd）
+        if: steps.source.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          WRANGLER_BIN="$RUNNER_TEMP/obf-tools/node_modules/.bin/wrangler" \
+            bash scripts/worker-smoke-test.sh "$SOURCE_FILE" "$RUNNER_TEMP/obfuscated-worker.js" "$RUNNER_TEMP/smoke"
+
+      - name: 组装部署产物
+        if: steps.source.outputs.skip != 'true'
+        env:
+          SEED: ${{ steps.obfuscate.outputs.seed }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          DEPLOY_DIR="$RUNNER_TEMP/deploy"
+          mkdir -p "$DEPLOY_DIR"
+          cp "$RUNNER_TEMP/obfuscated-worker.js" "$DEPLOY_DIR/$SOURCE_FILE"
+          cp wrangler.toml "$DEPLOY_DIR/wrangler.toml"
+
+          VERSION=$(grep -oE "Version = '[^']+'" "$SOURCE_FILE" | head -1 | sed -E "s/.*'([^']+)'.*/\1/" || true)
+          cat > "$DEPLOY_DIR/.obfuscate-meta.json" <<EOF
+          {
+            "source_file": "$SOURCE_FILE",
+            "source_sha256": "$SOURCE_SHA",
+            "source_commit": "$(git rev-parse HEAD)",
+            "source_version": "${VERSION:-unknown}",
+            "obfuscator": "javascript-obfuscator@$OBFUSCATOR_VERSION",
+            "seed": "$SEED",
+            "generated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          echo "产物：" && ls -la "$DEPLOY_DIR"
+          {
+            echo "### 混淆产物"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 源版本 | \`${VERSION:-unknown}\` |"
+            echo "| 源指纹 | \`$SOURCE_SHA\` |"
+            echo "| 随机种子 | \`$SEED\` |"
+            echo "| 源文件大小 | $(wc -c < "$SOURCE_FILE") 字节 |"
+            echo "| 混淆产物大小 | $(wc -c < "$DEPLOY_DIR/$SOURCE_FILE") 字节 |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 发布到 ${{ env.DEPLOY_BRANCH }} 分支
+        if: steps.source.outputs.skip != 'true'
+        env:
+          SEED: ${{ steps.obfuscate.outputs.seed }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          DEPLOY_DIR="$RUNNER_TEMP/deploy"
+          SOURCE_COMMIT=$(git rev-parse --short HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 部署分支只保留 CF 部署需要的最小内容，且每次都是单个孤儿提交（force-push）
+          git checkout --orphan "$DEPLOY_BRANCH"
+          git rm -rf . --quiet
+          cp -r "$DEPLOY_DIR/." .
+          git add "$SOURCE_FILE" wrangler.toml .obfuscate-meta.json
+          git commit --quiet -m "obfuscate: $SOURCE_FILE from main@$SOURCE_COMMIT (seed $SEED)"
+          git push --force origin "HEAD:refs/heads/$DEPLOY_BRANCH"
+
+          echo "已发布到 $DEPLOY_BRANCH（源提交 $SOURCE_COMMIT，seed $SEED）："
+          git log --oneline -1
+          git show --stat --oneline HEAD | tail -5
